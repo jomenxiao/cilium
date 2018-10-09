@@ -25,6 +25,19 @@ package bpf
 #include <sys/resource.h>
 #include <stdlib.h>
 
+// Only x86-64 and arm64 right now, but trivial to extend.
+#if defined(__x86_64__)
+# define mb()           asm volatile("mfence" ::: "memory")
+# define rmb()          asm volatile("lfence" ::: "memory")
+#elif defined(__aarch64__)
+# define mb()           asm volatile("dmb ish" ::: "memory")
+# define rmb()          asm volatile("dmb ishld" ::: "memory")
+#else
+# error "Please define mb(), rmb() barriers!"
+#endif
+
+#define READ_ONCE_64(x)	*((volatile uint64_t *) &x)
+
 void create_perf_event_attr(int type, int config, int sample_type,
 			    int wakeup_events, void *attr)
 {
@@ -36,7 +49,6 @@ void create_perf_event_attr(int type, int config, int sample_type,
 	ptr->config = config;
 	ptr->sample_type = sample_type;
 	ptr->wakeup_events = wakeup_events;
-
 }
 
 static void dump_data(uint8_t *data, size_t size, int cpu)
@@ -57,54 +69,81 @@ struct event_sample {
 
 struct read_state {
 	size_t raw_size;
-	void *base, *begin, *end, *head;
+	void *base;
+	uint64_t last_size;
 };
 
-int perf_event_read_init(int page_count, int page_size, void *_header, void *_state)
+// Contract with kernel/user space on perf ring buffer:
+//
+//   kernel                             user
+//
+//   if (LOAD ->data_tail) {            LOAD ->data_head
+//                      (A)             smp_rmb()       (C)
+//      STORE $data                     LOAD $data
+//      smp_wmb()       (B)             smp_mb()        (D)
+//      STORE ->data_head               STORE ->data_tail
+//   }
+
+static inline uint64_t perf_read_head(struct perf_event_mmap_page *up)
 {
-	volatile struct perf_event_mmap_page *header = _header;
-	struct read_state *state = _state;
-	uint64_t data_tail = header->data_tail;
-	uint64_t data_head = *((volatile uint64_t *) &header->data_head);
-
-	__sync_synchronize();
-	if (data_head == data_tail)
-		return 0;
-
-	state->head = (void *) data_head;
-	state->raw_size = page_count * page_size;
-	state->base  = ((uint8_t *)header) + page_size;
-	state->begin = state->base + data_tail % state->raw_size;
-	state->end   = state->base + data_head % state->raw_size;
-
-	return state->begin != state->end;
+	uint64_t data_head = READ_ONCE_64(up->data_head);
+	rmb();
+	return data_head;
 }
 
-int perf_event_read(void *_state, void *buf, void *_msg, void *_sample, void *_lost)
+static inline void perf_write_tail(struct perf_event_mmap_page *up,
+				   uint64_t data_tail)
 {
-	void **msg = (void **) _msg;
-	void **sample = (void **) _sample;
-	void **lost = (void **) _lost;
-	struct read_state *state = _state;
-	struct event_sample *e = state->begin;
+	mb();
+	up->data_tail = data_tail;
+}
 
-	if (state->begin == state->end)
+int perf_event_read_init(int page_count, int page_size, void *_page,
+			 void *_state)
+{
+	struct perf_event_mmap_page *up = _page;
+	struct read_state *state = _state;
+	uint64_t data_tail = up->data_tail;
+
+	if (perf_read_head(up) == data_tail)
 		return 0;
 
-	if (state->begin + e->header.size > state->base + state->raw_size) {
-		uint64_t len = state->base + state->raw_size - state->begin;
+	state->raw_size = page_count * page_size;
+	state->base  = ((uint8_t *)up) + page_size;
+	state->last_size = 0;
 
-		memcpy(buf, state->begin, len);
-		memcpy((char *) buf + len, state->base, e->header.size - len);
+	return 1;
+}
+
+int perf_event_read(void *_page, void *_state, void *buf, void *_msg,
+		    void *_sample, void *_lost)
+{
+	struct perf_event_mmap_page *up = _page;
+	struct read_state *state = _state;
+	struct event_sample *e;
+	void **sample = (void **) _sample;
+	void **lost = (void **) _lost;
+	void **msg = (void **) _msg;
+	uint64_t e_size, data_tail;
+	void *begin;
+
+	data_tail = up->data_tail + state->last_size;
+	perf_write_tail(up, data_tail);
+	if (perf_read_head(up) == data_tail)
+		return 0;
+
+	e = begin = state->base + data_tail % state->raw_size;
+	e_size = e->header.size;
+	if (begin + e_size > state->base + state->raw_size) {
+		uint64_t len = state->base + state->raw_size - begin;
+
+		memcpy(buf, begin, len);
+		memcpy((char *) buf + len, state->base, e_size - len);
 
 		e = buf;
-		state->begin = state->base + e->header.size - len;
-	} else if (state->begin + e->header.size == state->base + state->raw_size) {
-		state->begin = state->base;
-	} else {
-		state->begin += e->header.size;
 	}
 
+	state->last_size = e_size;
 	*msg = e;
 
 	if (e->header.type == PERF_RECORD_SAMPLE) {
@@ -116,14 +155,6 @@ int perf_event_read(void *_state, void *buf, void *_msg, void *_sample, void *_l
 	return 1;
 }
 
-void perf_event_read_finish(void *_header, void *_state)
-{
-	volatile struct perf_event_mmap_page *header = _header;
-	struct read_state *state = _state;
-
-	__sync_synchronize();
-	header->data_tail = (uint64_t) state->head;
-}
 */
 import "C"
 
@@ -204,7 +235,7 @@ type PerfEvent struct {
 	// state is placed here to reduce memory allocations
 	state unsafe.Pointer
 	// buf is placed here to reduce memory allocations
-	buf [256]byte
+	buf [4096]byte
 }
 
 // PerfEventHeader must match 'struct perf_event_header in <linux/perf_event.h>.
@@ -324,8 +355,9 @@ func (e *PerfEvent) Read(receive ReceiveFunc, lostFn LostFunc) {
 			lost   *PerfEventLost
 		)
 
-		if ok := C.perf_event_read(unsafe.Pointer(e.state),
-			unsafe.Pointer(&e.buf[0]), unsafe.Pointer(&msg), unsafe.Pointer(&sample), unsafe.Pointer(&lost)); ok == 0 {
+		if ok := C.perf_event_read(unsafe.Pointer(&e.data[0]),
+			unsafe.Pointer(e.state), unsafe.Pointer(&e.buf[0]),
+			unsafe.Pointer(&msg), unsafe.Pointer(&sample), unsafe.Pointer(&lost)); ok == 0 {
 			break
 		}
 
@@ -340,9 +372,6 @@ func (e *PerfEvent) Read(receive ReceiveFunc, lostFn LostFunc) {
 			e.unknown++
 		}
 	}
-
-	// Move ring buffer tail pointer
-	C.perf_event_read_finish(unsafe.Pointer(&e.data[0]), unsafe.Pointer(e.state))
 }
 
 func (e *PerfEvent) Close() {
